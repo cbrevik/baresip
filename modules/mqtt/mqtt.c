@@ -20,6 +20,40 @@ static struct mqtt {
 } s_mqtt;
 
 
+/* XXX: relay the response as a message ? */
+static int stdout_handler(const char *p, size_t size, void *arg)
+{
+	struct mqtt *mqtt = arg;
+	(void)mqtt;
+
+	if (1 != fwrite(p, size, 1, stdout))
+		return ENOMEM;
+
+	return 0;
+}
+
+
+static int publish_message(struct mqtt *mqtt, const char *message)
+{
+	int ret;
+
+	ret = mosquitto_publish(mqtt->mosq,
+				NULL,
+				topic,
+				(int)str_len(message),
+				message,
+				0,
+				false);
+	if (ret != MOSQ_ERR_SUCCESS) {
+		warning("mqtt: failed to publish (%s)\n",
+			mosquitto_strerror(ret));
+		return EINVAL;
+	}
+
+	return 0;
+}
+
+
 /* XXX: use mosquitto_socket and fd_listen instead? */
 static void tmr_handler(void *data)
 {
@@ -87,18 +121,51 @@ static void connect_callback(struct mosquitto *mosq, void *obj, int result)
 static void message_callback(struct mosquitto *mosq, void *obj,
 			     const struct mosquitto_message *message)
 {
+	struct mqtt *mqtt = obj;
+	struct re_printf pf_stdout = {stdout_handler, mqtt};
+	struct pl msg;
 	bool match = false;
 
 	info("mqtt: got message '%b' for topic '%s'\n",
 	     (char*) message->payload, (size_t)message->payloadlen,
 	     message->topic);
 
+	msg.p = message->payload;
+	msg.l = message->payloadlen;
+
 	mosquitto_topic_matches_sub(topic, message->topic, &match);
 	if (match) {
+
 		info("mqtt: got message for '%s' topic\n", topic);
 
 		/* XXX: handle message */
+
+		if (msg.l > 1 && msg.p[0] == '/') {
+
+			/* Relay message to long commands */
+			cmd_process_long(baresip_commands(),
+					 &msg.p[1],
+					 msg.l - 1,
+					 &pf_stdout, NULL);
+
+		}
+		else {
+			info("mqtt: message not handled (%r)\n", &msg);
+		}
 	}
+}
+
+
+/*
+ * Relay UA events as publish messages to the Broker
+ */
+static void ua_event_handler(struct ua *ua, enum ua_event ev,
+			     struct call *call, const char *prm, void *arg)
+{
+	struct mqtt *mqtt = arg;
+	const char *event_str = uag_event_str(ev);
+
+	publish_message(mqtt, event_str);
 }
 
 
@@ -135,6 +202,10 @@ static int module_init(void)
 
 	tmr_start(&s_mqtt.tmr, 1, tmr_handler, &s_mqtt);
 
+	err = uag_event_register(ua_event_handler, &s_mqtt);
+	if (err)
+		return err;
+
 	info("mqtt: module loaded\n");
 
 	return err;
@@ -143,6 +214,8 @@ static int module_init(void)
 
 static int module_close(void)
 {
+	uag_event_unregister(&ua_event_handler);
+
 	tmr_cancel(&s_mqtt.tmr);
 
 	if (s_mqtt.mosq) {
